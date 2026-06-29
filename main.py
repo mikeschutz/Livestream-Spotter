@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import argparse
 import logging
+import tomllib
 from pathlib import Path
 
+from livestream_spotter import __version__
 from livestream_spotter.config import load_config
 from livestream_spotter.detectors import AVAILABLE_DETECTORS
 from livestream_spotter.iracing import IRacingClient
 from livestream_spotter.obs.clock import MockClock, ObsClock
 from livestream_spotter.pipeline.bus import EventBus
 from livestream_spotter.pipeline.poll_loop import PollLoop
+from livestream_spotter.runtime_paths import (
+    invalid_config_message,
+    missing_config_message,
+    resolve_config_path,
+)
 from livestream_spotter.sinks.chapters import ChaptersSink
 from livestream_spotter.sinks.event_log import LoggingEventSink
 from livestream_spotter.sinks.fanout import FanoutEventSink
@@ -55,6 +62,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("config.toml"))
     parser.add_argument(
+        "--version",
+        action="version",
+        version=f"livestream-spotter {__version__}",
+    )
+    parser.add_argument(
         "--mock-clock",
         action="store_true",
         help="Use elapsed monotonic time instead of connecting to OBS.",
@@ -73,8 +85,17 @@ def main() -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    config = load_config(args.config)
-    LOGGER.info("Config loaded; polling at %.2f Hz", config.poll_hz)
+    config_path = resolve_config_path(args.config)
+    try:
+        config = load_config(config_path)
+    except FileNotFoundError:
+        LOGGER.critical(missing_config_message(config_path))
+        return 2
+    except (tomllib.TOMLDecodeError, KeyError) as error:
+        LOGGER.critical(invalid_config_message(config_path, error))
+        return 2
+    LOGGER.info("Livestream Spotter %s", __version__)
+    LOGGER.info("Config loaded from %s; polling at %.2f Hz", config_path, config.poll_hz)
 
     iracing = IRacingClient()
     clock = MockClock() if args.mock_clock else ObsClock(config.obs)
