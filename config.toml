@@ -1,0 +1,73 @@
+# Phase 0-1 runtime settings (wired now).
+[runtime]
+poll_hz = 15.0
+hold_until_stream_active = false
+race_only_player_events = true
+
+[obs]
+host = "localhost"
+port = 4455
+password = ""
+
+[output]
+raw_dump_path = "raw_dump.jsonl"
+timestamps_path = "timestamps.txt"
+chapters_path = "chapters.txt"
+renderers = ["timestamps"] # Add "chapters" to enable the parked strict renderer.
+
+[diagnostics]
+raw_dump_enabled = true
+raw_dump_hz = 1.0 # Explicit diagnostic cadence; independent of runtime.poll_hz
+
+# Settings below remain grouped by their owning PLAN phase. The current product
+# consumes event lead-ins, renderer spacing, and detector names.
+[profile]
+preset = "sprint" # "sprint" or "enduro"; Phase 4
+
+[lead_in_seconds]
+green = 2.0
+caution = 0.0
+white = 0.0
+restart = 2.0
+wreck = 6.0
+pit_in = 0.0
+pit_out = 0.0
+session_transition = 0.0
+checkered = 0.0
+overtake = 2.0
+overtaken = 2.0
+incident = 6.0
+tow = 6.0
+battle = 2.0
+player_flag = 0.0
+
+[battle]
+gap_threshold = 0.6
+min_duration = 9.0
+throttle_window = 60.0
+
+[chapters]
+min_spacing = 10.0
+
+[timestamps]
+min_spacing = 2.0 # Cosmetic dedupe only; zero disables spacing.
+
+[incidents]
+minimum_delta = 1
+
+[detectors]
+enabled = [
+  "session_transition",
+  "green",
+  "caution",
+  "white",
+  "restart",
+  "checkered",
+  "pit",
+  "overtake",
+  "incident",
+  "tow",
+  "battle",
+  "player_flag",
+]
+max_tier = 3

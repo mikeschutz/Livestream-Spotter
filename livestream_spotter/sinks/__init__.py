@@ -1,0 +1,2 @@
+"""Pipeline output consumers."""
+

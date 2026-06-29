@@ -1,0 +1,2 @@
+"""iRacing livestream telemetry sidecar."""
+

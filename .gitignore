@@ -1,0 +1,17 @@
+_meta/
+.obsidian/
+CLAUDE.md
+AGENTS.md
+Thumbs.db
+.DS_Store
+timestamps.txt
+raw_dump.jsonl
+*.tmp
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+build/
+dist/
+*.spec
