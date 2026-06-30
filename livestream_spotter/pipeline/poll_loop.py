@@ -315,10 +315,18 @@ class PollLoop:
 
         reading = self._clock.read()
         if not reading.output_active or reading.video_ms is None:
-            if self._hold_until_stream_active:
+            if reading.connected:
+                self._held.clear()
+                self._reported_holding = False
+                for item in pending:
+                    LOGGER.debug(
+                        "Event %s dropped — OBS not recording/streaming",
+                        item.intent.event_type,
+                    )
+            elif self._hold_until_stream_active:
                 self._held = pending
                 if not self._reported_holding:
-                    LOGGER.info("Holding Events until the OBS stream is active")
+                    LOGGER.info("Holding Events until the OBS connection is available")
                     self._reported_holding = True
             else:
                 self._held.clear()

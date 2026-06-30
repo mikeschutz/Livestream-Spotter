@@ -7,7 +7,7 @@ race_only_player_events = true
 [obs]
 host = "localhost"
 port = 4455
-password = ""
+password = "8Pe8BjDptGWI9ERG"
 
 [output]
 raw_dump_path = "raw_dump.jsonl"

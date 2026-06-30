@@ -1,9 +1,14 @@
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from livestream_spotter.config import ObsConfig
 from livestream_spotter.iracing import IRacingClient
-from livestream_spotter.obs.clock import MockClock, ObsClock
+from livestream_spotter.obs.clock import (
+    MockClock,
+    ObsClock,
+    _is_authentication_error,
+)
 
 
 class FakeSdk:
@@ -68,9 +73,86 @@ class ConnectionTests(unittest.TestCase):
             retry_seconds=2.0,
         )
 
-        self.assertFalse(client.connect())
+        with self.assertLogs("livestream_spotter.iracing", level="INFO") as logs:
+            self.assertFalse(client.connect())
         self.assertFalse(client.connect())
         self.assertEqual(sdk.shutdown_calls, 1)
+        self.assertIn(
+            "Waiting for iRacing session (start iRacing when ready)",
+            logs.output[0],
+        )
+        self.assertNotIn("failed", logs.output[0].lower())
+
+    def test_timeout_is_not_classified_as_authentication_error(self) -> None:
+        from obsws_python.error import OBSSDKError, OBSSDKTimeoutError
+
+        # A bare auth error stays auth; a timeout subclass must not.
+        self.assertTrue(_is_authentication_error(OBSSDKError("auth rejected")))
+        self.assertFalse(
+            _is_authentication_error(OBSSDKTimeoutError("connect timed out"))
+        )
+
+    def test_obs_connection_success_reports_endpoint(self) -> None:
+        obs = FakeObsClient([])
+        clock = ObsClock(
+            ObsConfig("studio-pc", 4455, ""),
+            client_factory=lambda **_: obs,
+        )
+
+        with self.assertLogs("livestream_spotter.obs.clock", level="INFO") as logs:
+            self.assertTrue(clock.connect())
+
+        self.assertIn(
+            "Connected to OBS WebSocket at studio-pc:4455",
+            logs.output[0],
+        )
+        clock.disconnect()
+
+    def test_obs_connection_refused_reports_server_settings_hint(self) -> None:
+        def refuse(**_):
+            raise ConnectionRefusedError("no listener")
+
+        clock = ObsClock(
+            ObsConfig("studio-pc", 4456, ""),
+            client_factory=refuse,
+            monotonic=lambda: 0.0,
+        )
+
+        with self.assertLogs("livestream_spotter.obs.clock", level="WARNING") as logs:
+            self.assertFalse(clock.connect())
+
+        self.assertIn(
+            "Could not reach OBS WebSocket at studio-pc:4456",
+            logs.output[0],
+        )
+        self.assertIn("Tools -> WebSocket Server Settings", logs.output[0])
+
+    def test_obs_auth_rejection_reports_password_hint(self) -> None:
+        def reject(**_):
+            raise RuntimeError("authentication rejected")
+
+        clock = ObsClock(
+            ObsConfig("localhost", 4455, "wrong"),
+            client_factory=reject,
+            monotonic=lambda: 0.0,
+        )
+
+        with (
+            patch(
+                "livestream_spotter.obs.clock._is_authentication_error",
+                return_value=True,
+            ),
+            self.assertLogs(
+                "livestream_spotter.obs.clock", level="WARNING"
+            ) as logs,
+        ):
+            self.assertFalse(clock.connect())
+
+        self.assertIn(
+            "Connected to OBS but authentication failed",
+            logs.output[0],
+        )
+        self.assertIn("password in config.toml matches OBS", logs.output[0])
 
     def test_obs_reads_only_active_output_duration(self) -> None:
         obs = FakeObsClient(
@@ -85,6 +167,7 @@ class ConnectionTests(unittest.TestCase):
         )
 
         inactive = clock.read()
+        self.assertEqual(obs.disconnect_calls, 0)
         active = clock.read()
 
         self.assertFalse(inactive.output_active)
@@ -108,6 +191,37 @@ class ConnectionTests(unittest.TestCase):
         self.assertIsNone(reading.video_ms)
         self.assertEqual(obs.disconnect_calls, 1)
 
+    def test_obs_drop_spaces_reconnect_attempts(self) -> None:
+        now = [0.0]
+        clients = iter(
+            [
+                FakeObsClient([OSError("gone")]),
+                FakeObsClient([]),
+            ]
+        )
+        factory_calls = 0
+
+        def factory(**_):
+            nonlocal factory_calls
+            factory_calls += 1
+            return next(clients)
+
+        clock = ObsClock(
+            ObsConfig("localhost", 4455, ""),
+            client_factory=factory,
+            monotonic=lambda: now[0],
+            retry_seconds=2.0,
+        )
+
+        clock.read()
+        self.assertFalse(clock.connect())
+        self.assertEqual(factory_calls, 1)
+
+        now[0] = 2.0
+        self.assertTrue(clock.connect())
+        self.assertEqual(factory_calls, 2)
+        clock.disconnect()
+
     def test_mock_clock_is_monotonic_and_resets_on_disconnect(self) -> None:
         readings = iter([10.0, 10.25, 20.0, 20.1])
         clock = MockClock(monotonic=lambda: next(readings))
@@ -121,4 +235,3 @@ class ConnectionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

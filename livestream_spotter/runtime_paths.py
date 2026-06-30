@@ -7,6 +7,7 @@ import sys
 
 
 CONFIG_FILENAME = "config.toml"
+LASTRUN_LOG_FILENAME = "lastrun.log"
 
 
 def is_frozen() -> bool:
@@ -22,6 +23,11 @@ def resolve_config_path(path: Path) -> Path:
     if is_frozen() and not path.is_absolute():
         return executable_dir() / path
     return path
+
+
+def resolve_lastrun_log_path(config_path: Path) -> Path:
+    """Place the per-run log beside the resolved config (and frozen exe)."""
+    return config_path.resolve().parent / LASTRUN_LOG_FILENAME
 
 
 def missing_config_message(path: Path) -> str:

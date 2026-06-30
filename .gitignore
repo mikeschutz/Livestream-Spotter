@@ -6,6 +6,7 @@ Thumbs.db
 .DS_Store
 timestamps.txt
 raw_dump.jsonl
+lastrun.log
 *.tmp
 __pycache__/
 *.py[cod]

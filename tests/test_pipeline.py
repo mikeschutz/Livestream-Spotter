@@ -452,14 +452,14 @@ class PipelineTests(unittest.TestCase):
             ["green", "caution", "restart"],
         )
 
-    def test_event_is_held_until_stream_becomes_active(self) -> None:
+    def test_event_is_held_until_obs_reconnects(self) -> None:
         before = hand_built_snapshot(SessionState=3)
         after = hand_built_snapshot(SessionState=4, SessionTime=55.0)
         steady = hand_built_snapshot(SessionState=4, SessionTime=56.0)
         loop, sink, _ = self.make_loop(
             [before, after, steady],
             [
-                ClockReading(None, False, "obs"),
+                ClockReading(None, False, "obs", connected=False),
                 ClockReading(80, True, "obs"),
             ],
         )
@@ -471,19 +471,26 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(sink.items[0].video_ms, 80)
         self.assertEqual(sink.items[0].session_time, 55.0)
 
-    def test_inactive_event_is_dropped_when_hold_is_disabled(self) -> None:
+    def test_event_is_dropped_and_logged_when_obs_output_is_inactive(self) -> None:
         loop, sink, _ = self.make_loop(
             [
                 hand_built_snapshot(SessionState=3),
                 hand_built_snapshot(SessionState=4),
             ],
             [ClockReading(None, False, "obs")],
-            hold=False,
         )
 
         loop.tick()
-        self.assertFalse(loop.tick())
+        with self.assertLogs(
+            "livestream_spotter.pipeline.poll_loop", level="DEBUG"
+        ) as logs:
+            self.assertFalse(loop.tick())
+
         self.assertEqual(sink.items, [])
+        self.assertIn(
+            "Event green dropped — OBS not recording/streaming",
+            logs.output[0],
+        )
 
     def test_raw_diagnostic_cadence_is_independent_of_polling(self) -> None:
         raw_sink = CollectingSink()

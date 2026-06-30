@@ -59,7 +59,9 @@ class IRacingClient:
             if not sdk.startup():
                 sdk.shutdown()
                 if not self._reported_waiting:
-                    LOGGER.info("Waiting for an active iRacing session or replay")
+                    LOGGER.info(
+                        "Waiting for iRacing session (start iRacing when ready)"
+                    )
                     self._reported_waiting = True
                 return False
             self._sdk = sdk

@@ -8,6 +8,7 @@ from livestream_spotter.config import load_config
 from livestream_spotter.runtime_paths import (
     missing_config_message,
     resolve_config_path,
+    resolve_lastrun_log_path,
 )
 
 
@@ -44,6 +45,20 @@ class RuntimePathTests(unittest.TestCase):
                     resolve_config_path(Path("config.toml")),
                     Path(temp_dir) / "config.toml",
                 )
+
+    def test_frozen_run_places_lastrun_log_beside_exe(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            exe_path = Path(temp_dir) / "livestream-spotter.exe"
+            with (
+                patch.object(sys, "frozen", True, create=True),
+                patch.object(sys, "executable", str(exe_path)),
+            ):
+                config_path = resolve_config_path(Path("config.toml"))
+
+            self.assertEqual(
+                resolve_lastrun_log_path(config_path),
+                Path(temp_dir) / "lastrun.log",
+            )
 
     def test_frozen_absolute_config_path_is_not_rebased(self) -> None:
         absolute = Path("C:/custom/config.toml")

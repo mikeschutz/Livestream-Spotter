@@ -4,7 +4,7 @@ from PyInstaller.utils.hooks import collect_submodules
 
 
 hiddenimports = []
-for package in ("irsdk", "obsws_python"):
+for package in ("irsdk", "obsws_python", "colorama"):
     try:
         hiddenimports += collect_submodules(package)
     except Exception:

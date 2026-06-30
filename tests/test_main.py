@@ -1,13 +1,22 @@
+import contextlib
+import io
+import logging
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from livestream_spotter.detectors import PHASE_TWO_DETECTORS
 from livestream_spotter.events import Event
 import main as main_module
-from main import build_event_sink, select_detectors
+from main import (
+    build_event_sink,
+    close_logging,
+    configure_logging,
+    connect_startup_services,
+    select_detectors,
+)
 
 
 class DetectorSelectionTests(unittest.TestCase):
@@ -42,6 +51,128 @@ class RendererSelectionTests(unittest.TestCase):
 
 
 class MainTests(unittest.TestCase):
+    def test_startup_attempts_obs_even_while_iracing_is_unavailable(self) -> None:
+        iracing = Mock()
+        iracing.connect.return_value = False
+        clock = Mock()
+        clock.connect.return_value = True
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = connect_startup_services(iracing, clock)
+
+        self.assertEqual(result, (True, False))
+        clock.connect.assert_called_once_with()
+        iracing.connect.assert_called_once_with()
+
+    def test_startup_status_uses_neutral_marker_while_iracing_waits(self) -> None:
+        iracing = Mock()
+        iracing.connect.return_value = False
+        clock = Mock()
+        clock.connect.return_value = True
+
+        with (
+            patch.object(main_module, "_STATUS_COLORS", {}),
+            patch.object(main_module, "_STATUS_RESET", ""),
+        ):
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                connect_startup_services(iracing, clock)
+
+        out = buffer.getvalue()
+        self.assertIn("[ OK ] OBS WebSocket", out)
+        self.assertIn("[ .. ] iRacing", out)
+        self.assertNotIn("[FAIL] iRacing", out)
+        self.assertNotIn("\x1b[", out)  # never emit raw ANSI when degraded
+
+    def test_startup_status_marks_obs_failure(self) -> None:
+        iracing = Mock()
+        iracing.connect.return_value = True
+        clock = Mock()
+        clock.connect.return_value = False
+
+        with (
+            patch.object(main_module, "_STATUS_COLORS", {}),
+            patch.object(main_module, "_STATUS_RESET", ""),
+        ):
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                connect_startup_services(iracing, clock)
+
+        out = buffer.getvalue()
+        self.assertIn("[FAIL] OBS WebSocket", out)
+        self.assertIn("[ OK ] iRacing", out)
+
+    def test_status_marker_is_color_wrapped_when_color_available(self) -> None:
+        with (
+            patch.object(main_module, "_STATUS_COLORS", {"ok": "<G>"}),
+            patch.object(main_module, "_STATUS_RESET", "<R>"),
+            patch.object(main_module, "_color_enabled", return_value=True),
+        ):
+            self.assertEqual(main_module._format_status("ok"), "<G>[ OK ]<R>")
+
+    def test_status_marker_stays_plain_when_stdout_is_not_a_tty(self) -> None:
+        # Redirected/non-tty stdout must never receive raw ANSI codes.
+        with (
+            patch.object(main_module, "_STATUS_COLORS", {"ok": "\x1b[32m"}),
+            patch.object(main_module, "_STATUS_RESET", "\x1b[0m"),
+        ):
+            buffer = io.StringIO()  # StringIO.isatty() is False
+            with contextlib.redirect_stdout(buffer):
+                rendered = main_module._format_status("ok")
+        self.assertEqual(rendered, "[ OK ]")
+        self.assertNotIn("\x1b[", rendered)
+
+    def test_obsws_connect_traceback_is_suppressed(self) -> None:
+        captured: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                captured.append(record)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            configure_logging(Path(temp_dir) / "lastrun.log")
+            sink = _Capture()
+            logging.getLogger().addHandler(sink)
+            try:
+                # Mimic obsws-python logging its own TimeoutError traceback on a
+                # failed connect (logger "obsws_python.baseclient.ObsClient").
+                obs_logger = logging.getLogger("obsws_python.baseclient.ObsClient")
+                try:
+                    raise TimeoutError("timed out")
+                except TimeoutError:
+                    obs_logger.exception("Failed to connect to OBS")
+                # Our own clean failure line still gets through.
+                logging.getLogger("livestream_spotter.obs.clock").warning(
+                    "Could not reach OBS WebSocket at localhost:4455"
+                )
+            finally:
+                logging.getLogger().removeHandler(sink)
+                close_logging()
+
+        names = [record.name for record in captured]
+        messages = [record.getMessage() for record in captured]
+        self.assertFalse(
+            any(name.startswith("obsws_python") for name in names),
+            f"obsws_python traceback leaked to handlers: {names}",
+        )
+        self.assertTrue(
+            any("Could not reach OBS WebSocket" in message for message in messages)
+        )
+
+    def test_lastrun_log_is_fresh_and_includes_debug(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "lastrun.log"
+            log_path.write_text("stale run\n", encoding="utf-8")
+
+            configure_logging(log_path)
+            main_module.LOGGER.debug("resolved config path: test")
+            close_logging()
+
+            contents = log_path.read_text(encoding="utf-8")
+
+        self.assertIn("resolved config path: test", contents)
+        self.assertNotIn("stale run", contents)
+
     def test_missing_config_returns_clear_error_without_traceback(self) -> None:
         args = SimpleNamespace(
             config=Path("config.toml"),
