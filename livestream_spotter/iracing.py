@@ -114,3 +114,8 @@ class IRacingClient:
                 except Exception:
                     LOGGER.exception("Failed releasing iRacing telemetry buffer")
                     self.disconnect()
+
+
+def is_iracing_session_active(ir: IRacingClient) -> bool:
+    """Return the single authoritative iRacing active-session signal."""
+    return ir.connected

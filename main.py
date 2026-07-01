@@ -12,6 +12,7 @@ from livestream_spotter import __version__
 from livestream_spotter.config import load_config
 from livestream_spotter.detectors import AVAILABLE_DETECTORS
 from livestream_spotter.iracing import IRacingClient
+from livestream_spotter.lifecycle import LifecycleController
 from livestream_spotter.obs.clock import MockClock, ObsClock
 from livestream_spotter.pipeline.bus import EventBus
 from livestream_spotter.pipeline.poll_loop import PollLoop
@@ -111,6 +112,8 @@ def configure_logging(log_path: Path) -> None:
     # library below CRITICAL to avoid leaking the password and dumping a scary
     # traceback on an expected, handled failure.
     logging.getLogger("obsws_python").setLevel(logging.CRITICAL)
+    # websocket-client reports the normal 1001 "going away" close as ERROR.
+    logging.getLogger("websocket").setLevel(logging.CRITICAL)
 
 
 def close_logging() -> None:
@@ -124,8 +127,8 @@ def close_logging() -> None:
 
 def connect_startup_services(iracing: IRacingClient, clock) -> tuple[bool, bool]:
     """Attempt both startup connections independently before polling."""
-    obs_connected = clock.connect()
     iracing_connected = iracing.connect()
+    obs_connected = clock.connect()
     LOGGER.debug(
         "Startup connection results: OBS=%s, iRacing=%s",
         "connected" if obs_connected else "not connected",
@@ -233,8 +236,12 @@ def main() -> int:
     )
 
     iracing = IRacingClient()
-    clock = MockClock() if args.mock_clock else ObsClock(config.obs)
-    connect_startup_services(iracing, clock)
+    clock = (
+        MockClock()
+        if args.mock_clock
+        else ObsClock(config.obs, timestamp_source=config.timestamp_source)
+    )
+    obs_connected, iracing_connected = connect_startup_services(iracing, clock)
     event_sink = build_event_sink(config)
     raw_sink = JsonlRawSink(config.raw_dump_path) if config.raw_dump_enabled else None
     detectors = select_detectors(config.enabled_detectors)
@@ -246,7 +253,7 @@ def main() -> int:
         detectors=detectors,
         lead_in_ms=config.lead_in_ms,
         poll_hz=config.poll_hz,
-        hold_until_stream_active=config.hold_until_stream_active,
+        hold_until_output_active=config.hold_until_output_active,
         race_only_player_events=config.race_only_player_events,
         battle_gap_threshold=config.battle_gap_threshold,
         battle_min_duration=config.battle_min_duration,
@@ -255,8 +262,16 @@ def main() -> int:
         raw_sink=raw_sink,
         raw_dump_hz=config.raw_dump_hz,
     )
+    lifecycle = LifecycleController(
+        iracing=iracing,
+        clock=clock,
+        pipeline=poll_loop,
+        poll_hz=config.poll_hz,
+        startup_iracing_active=iracing_connected,
+        startup_obs_connected=obs_connected,
+    )
     try:
-        poll_loop.run(once=args.once)
+        lifecycle.run(once=args.once)
         return 0
     except KeyboardInterrupt:
         LOGGER.info("Stopped")

@@ -2,7 +2,8 @@
 # Edit this file (kept beside livestream-spotter.exe) for your setup.
 [runtime]
 poll_hz = 15.0
-hold_until_stream_active = false
+timestamp_source = "auto" # "auto", "stream", or "record"
+hold_until_output_active = false
 race_only_player_events = true
 
 [obs]

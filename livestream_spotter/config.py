@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 import tomllib
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -17,7 +20,8 @@ class ObsConfig:
 @dataclass(frozen=True)
 class AppConfig:
     poll_hz: float
-    hold_until_stream_active: bool
+    timestamp_source: str
+    hold_until_output_active: bool
     race_only_player_events: bool
     raw_dump_enabled: bool
     raw_dump_hz: float
@@ -58,6 +62,24 @@ def load_config(path: Path) -> AppConfig:
     battle_throttle_window = float(battle.get("throttle_window", 60.0))
     incident_minimum_delta = int(incidents.get("minimum_delta", 1))
     port = int(obs["port"])
+    timestamp_source = runtime.get("timestamp_source", "auto")
+    legacy_hold_present = "hold_until_stream_active" in runtime
+    if legacy_hold_present:
+        LOGGER.warning(
+            "Config key 'hold_until_stream_active' is deprecated; use "
+            "'hold_until_output_active' instead. The legacy name will be "
+            "removed in 0.2.0."
+        )
+        if "hold_until_output_active" in runtime:
+            LOGGER.warning(
+                "Config keys 'hold_until_stream_active' and "
+                "'hold_until_output_active' are both set; using "
+                "'hold_until_output_active'."
+            )
+    if "hold_until_output_active" in runtime:
+        hold_until_output_active = runtime["hold_until_output_active"]
+    else:
+        hold_until_output_active = runtime.get("hold_until_stream_active", False)
 
     if poll_hz <= 0:
         raise ValueError("runtime.poll_hz must be greater than zero")
@@ -75,6 +97,10 @@ def load_config(path: Path) -> AppConfig:
         raise ValueError("incidents.minimum_delta must be greater than zero")
     if not 1 <= port <= 65535:
         raise ValueError("obs.port must be between 1 and 65535")
+    if timestamp_source not in {"auto", "stream", "record"}:
+        raise ValueError(
+            "runtime.timestamp_source must be 'auto', 'stream', or 'record'"
+        )
 
     output_path = Path(output["raw_dump_path"])
     if not output_path.is_absolute():
@@ -143,7 +169,8 @@ def load_config(path: Path) -> AppConfig:
 
     return AppConfig(
         poll_hz=poll_hz,
-        hold_until_stream_active=bool(runtime["hold_until_stream_active"]),
+        timestamp_source=timestamp_source,
+        hold_until_output_active=bool(hold_until_output_active),
         race_only_player_events=bool(runtime.get("race_only_player_events", True)),
         raw_dump_enabled=bool(diagnostics.get("raw_dump_enabled", False)),
         raw_dump_hz=raw_dump_hz,

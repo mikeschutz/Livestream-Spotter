@@ -9,12 +9,16 @@ class CollectingSink:
     def __init__(self) -> None:
         self.events = []
         self.closed = False
+        self.flush_calls = 0
 
     def write(self, event: Event) -> None:
         self.events.append(event)
 
     def close(self) -> None:
         self.closed = True
+
+    def flush(self) -> None:
+        self.flush_calls += 1
 
 
 class LoggingEventSinkTests(unittest.TestCase):
@@ -40,12 +44,15 @@ class FanoutEventSinkTests(unittest.TestCase):
         event = Event(1234, "pit_in", "Pit in", 1, 8, 99.5, 0, {})
 
         sink.write(event)
+        sink.flush()
         sink.close()
 
         self.assertEqual(first.events, [event])
         self.assertEqual(second.events, [event])
         self.assertTrue(first.closed)
         self.assertTrue(second.closed)
+        self.assertEqual(first.flush_calls, 1)
+        self.assertEqual(second.flush_calls, 1)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ A lightweight sidecar that watches iRacing telemetry during a live broadcast, de
 
 It reads the iRacing SDK and OBS (via WebSocket) live, and writes a `timestamps.txt` you drop straight into your video description. The goal isn't to write your description for you — it's to hand you a correct, complete skeleton so all that's left is your own commentary.
 
-> **Status: v0.1.0 — early.** Feature-complete and validated against real races, but thresholds (especially battle detection) are still being tuned. Expect rough edges and please report them via Issues.
+> **Status: v0.1.x — early.** Feature-complete and validated against real races, but thresholds (especially battle detection) are still being tuned. Expect rough edges and please report them via Issues.
 
 ## What it captures
 
@@ -25,11 +25,11 @@ Because it's a cockpit-view tool, it focuses on events where you or a car right 
 
 ## Quick start (built release)
 
-1. Download the latest `.zip` from [Releases](https://claude.ai/releases).
+1. Download the latest `.zip` from [Releases](https://github.com/mikeschutz/Livestream-Spotter/releases).
 2. Unzip it anywhere.
 3. In OBS: **Tools → WebSocket Server Settings → Enable**. Note the port and password.
 4. Open `config.toml` next to the exe and set the OBS port/password to match.
-5. Start your OBS stream (or recording), then run `livestream-spotter.exe`.
+5. Run `livestream-spotter.exe`. Start OBS and enter an iRacing session in either order; the app auto-arms when both are available.
 6. Race. When you're done, open `timestamps.txt` — paste it into your YouTube description.
 
 See the README inside the zip for more detail.
@@ -43,10 +43,32 @@ pip install -r requirements.txt
 python main.py
 ```
 
+## Configuration
+
+The release includes a commented `config.toml`. The main runtime options are:
+
+```toml
+[runtime]
+poll_hz = 15.0
+timestamp_source = "auto" # "auto", "stream", or "record"
+hold_until_output_active = false
+race_only_player_events = true
+```
+
+`timestamp_source = "auto"` prefers streaming when both OBS outputs are active, then falls back to recording. Choose `"stream"` or `"record"` to require that specific output.
+
+When no selected OBS output is active, `hold_until_output_active = true` buffers events until one starts. `false` emits them immediately with a `00:00` timestamp. The legacy name `hold_until_stream_active` remains supported in v0.1.x but is deprecated and will be removed in v0.2.0.
+
 ## How it works
 
-A single decoupled pipeline: a poll loop reads the iRacing SDK, pure detector functions emit events, and sinks render them. Video timestamps come from OBS's `outputDuration` (never iRacing's session clock), so markers line up with your actual stream. Two output renderers share one event stream — plain timestamps (default) and stricter YouTube chapters. See [SPEC.md](https://claude.ai/chat/SPEC.md) for the design.
+A single decoupled pipeline: a poll loop reads the iRacing SDK, pure detector functions emit events, and sinks render them. Video timestamps come from OBS's `outputDuration` (never iRacing's session clock), so markers line up with your actual stream. Two output renderers share one event stream — plain timestamps (default) and stricter YouTube chapters.
+
+Livestream Spotter can run continuously: it idles cheaply, notices when iRacing enters a session, connects or reconnects to OBS, and captures events only while both are available. See the [application lifecycle](SPEC.md#application-lifecycle) and the rest of [SPEC.md](SPEC.md) for the detailed design.
+
+## Troubleshooting
+
+If Livestream Spotter cannot reach OBS, open **Tools → WebSocket Server Settings** in OBS, enable the WebSocket server, and confirm its port and password match `config.toml`.
 
 ## License
 
-MIT — see [LICENSE](https://claude.ai/chat/LICENSE).
+MIT — see [LICENSE](LICENSE).

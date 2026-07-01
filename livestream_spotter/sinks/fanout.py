@@ -16,6 +16,12 @@ class FanoutEventSink:
         for sink in self._sinks:
             sink.write(event)
 
+    def flush(self) -> None:
+        for sink in self._sinks:
+            flush = getattr(sink, "flush", None)
+            if callable(flush):
+                flush()
+
     def close(self) -> None:
         for sink in self._sinks:
             sink.close()

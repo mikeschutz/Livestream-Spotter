@@ -52,15 +52,17 @@ class RendererSelectionTests(unittest.TestCase):
 
 class MainTests(unittest.TestCase):
     def test_startup_attempts_obs_even_while_iracing_is_unavailable(self) -> None:
+        call_order = []
         iracing = Mock()
-        iracing.connect.return_value = False
+        iracing.connect.side_effect = lambda: call_order.append("iracing") or False
         clock = Mock()
-        clock.connect.return_value = True
+        clock.connect.side_effect = lambda: call_order.append("obs") or True
 
         with contextlib.redirect_stdout(io.StringIO()):
             result = connect_startup_services(iracing, clock)
 
         self.assertEqual(result, (True, False))
+        self.assertEqual(call_order, ["iracing", "obs"])
         clock.connect.assert_called_once_with()
         iracing.connect.assert_called_once_with()
 
@@ -141,6 +143,7 @@ class MainTests(unittest.TestCase):
                     raise TimeoutError("timed out")
                 except TimeoutError:
                     obs_logger.exception("Failed to connect to OBS")
+                logging.getLogger("websocket").error("close status: 1001")
                 # Our own clean failure line still gets through.
                 logging.getLogger("livestream_spotter.obs.clock").warning(
                     "Could not reach OBS WebSocket at localhost:4455"
@@ -155,6 +158,7 @@ class MainTests(unittest.TestCase):
             any(name.startswith("obsws_python") for name in names),
             f"obsws_python traceback leaked to handlers: {names}",
         )
+        self.assertFalse(any(name.startswith("websocket") for name in names))
         self.assertTrue(
             any("Could not reach OBS WebSocket" in message for message in messages)
         )

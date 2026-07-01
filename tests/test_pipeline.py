@@ -16,7 +16,7 @@ from livestream_spotter.detectors.reliable import (
     detect_restart,
 )
 from livestream_spotter.detectors.player import detect_battle
-from livestream_spotter.events import Event
+from livestream_spotter.events import Event, EventIntent
 from livestream_spotter.obs.clock import ClockReading
 from livestream_spotter.pipeline.bus import EventBus
 from livestream_spotter.pipeline.poll_loop import PollLoop
@@ -66,6 +66,7 @@ def event(number: int) -> Event:
 class CollectingSink:
     def __init__(self) -> None:
         self.items = []
+        self.flush_calls = 0
 
     def write(self, item) -> None:
         self.items.append(item)
@@ -73,15 +74,20 @@ class CollectingSink:
     def close(self) -> None:
         pass
 
+    def flush(self) -> None:
+        self.flush_calls += 1
+
 
 class FakeIRacing:
     def __init__(self, snapshots) -> None:
         self.snapshots = iter(snapshots)
+        self.capture_calls = 0
 
     def connect(self) -> bool:
         return True
 
     def capture(self, fields):
+        self.capture_calls += 1
         return next(self.snapshots)
 
 
@@ -238,7 +244,7 @@ class PipelineTests(unittest.TestCase):
             detectors=detectors,
             lead_in_ms={"green": 2000, "battle": 2000},
             poll_hz=15,
-            hold_until_stream_active=hold,
+            hold_until_output_active=hold,
             raw_sink=raw_sink,
             raw_dump_hz=raw_dump_hz,
             monotonic=monotonic,
@@ -246,7 +252,37 @@ class PipelineTests(unittest.TestCase):
             battle_min_duration=battle_min_duration,
             battle_throttle_window=battle_throttle_window,
         )
+        loop.activate()
         return loop, event_sink, clock
+
+    def test_inactive_pipeline_does_not_capture_or_run_detectors(self) -> None:
+        loop, sink, clock = self.make_loop(
+            [hand_built_snapshot()],
+            [],
+        )
+        loop.deactivate()
+
+        self.assertFalse(loop.tick())
+        self.assertEqual(sink.items, [])
+        self.assertEqual(clock.read_calls, 0)
+
+    def test_reactivation_discards_previous_snapshot(self) -> None:
+        loop, sink, clock = self.make_loop(
+            [
+                hand_built_snapshot(SessionState=3),
+                hand_built_snapshot(SessionState=4),
+            ],
+            [],
+        )
+
+        loop.tick()
+        loop.deactivate()
+        loop.activate()
+        loop.tick()
+
+        self.assertEqual(sink.items, [])
+        self.assertEqual(clock.read_calls, 0)
+        self.assertEqual(sink.flush_calls, 1)
 
     def test_pipeline_attaches_obs_time_not_session_time(self) -> None:
         before = hand_built_snapshot(SessionState=3, SessionTime=10.0)
@@ -452,7 +488,7 @@ class PipelineTests(unittest.TestCase):
             ["green", "caution", "restart"],
         )
 
-    def test_event_is_held_until_obs_reconnects(self) -> None:
+    def test_event_is_held_until_output_becomes_active(self) -> None:
         before = hand_built_snapshot(SessionState=3)
         after = hand_built_snapshot(SessionState=4, SessionTime=55.0)
         steady = hand_built_snapshot(SessionState=4, SessionTime=56.0)
@@ -471,24 +507,45 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(sink.items[0].video_ms, 80)
         self.assertEqual(sink.items[0].session_time, 55.0)
 
-    def test_event_is_dropped_and_logged_when_obs_output_is_inactive(self) -> None:
+    def test_buffered_events_get_fresh_timestamps_when_flushed(self) -> None:
+        loop, sink, _ = self.make_loop(
+            [],
+            [
+                ClockReading(None, False, "obs"),
+                ClockReading(80, True, "obs"),
+                ClockReading(81, True, "obs"),
+            ],
+        )
+        intentions = [
+            EventIntent("green", "First", 1, None, {}),
+            EventIntent("green", "Second", 1, None, {}),
+        ]
+
+        self.assertEqual(loop._stamp_and_publish(intentions), 0)
+        self.assertEqual(loop._stamp_and_publish([]), 2)
+
+        self.assertEqual([item.video_ms for item in sink.items], [80, 81])
+
+    def test_event_is_emitted_at_zero_when_obs_output_is_inactive(self) -> None:
         loop, sink, _ = self.make_loop(
             [
                 hand_built_snapshot(SessionState=3),
                 hand_built_snapshot(SessionState=4),
             ],
             [ClockReading(None, False, "obs")],
+            hold=False,
         )
 
         loop.tick()
         with self.assertLogs(
-            "livestream_spotter.pipeline.poll_loop", level="DEBUG"
+            "livestream_spotter.pipeline.poll_loop", level="WARNING"
         ) as logs:
-            self.assertFalse(loop.tick())
+            self.assertTrue(loop.tick())
 
-        self.assertEqual(sink.items, [])
+        self.assertEqual(len(sink.items), 1)
+        self.assertEqual(sink.items[0].video_ms, 0)
         self.assertIn(
-            "Event green dropped — OBS not recording/streaming",
+            "Event green emitted with video_ms=0 — no OBS output active",
             logs.output[0],
         )
 

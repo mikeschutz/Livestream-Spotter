@@ -185,6 +185,18 @@ class TimestampsSinkTests(unittest.TestCase):
         sink.close()
         self.assertEqual(self.lines(), ["00:10 Pit stop 1"])
 
+    def test_lifecycle_flush_publishes_open_pit_without_closing_sink(self) -> None:
+        sink = TimestampsSink(self.path)
+        sink.write(event(12_000, "Pit in", event_type="pit_in"))
+
+        sink.flush()
+        sink.write(event(20_000, "Green", event_type="green"))
+
+        self.assertEqual(
+            self.path.read_text().splitlines(),
+            ["00:12 Pit stop 1", "00:20 Green"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

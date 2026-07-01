@@ -27,6 +27,8 @@ from livestream_spotter.sinks.base import EventSink, RawSink
 
 LOGGER = logging.getLogger(__name__)
 
+MAX_HELD_EVENTS = 10_000
+
 RACE_ONLY_EVENT_TYPES = {
     "pit_in",
     "pit_out",
@@ -61,7 +63,7 @@ class PollLoop:
         detectors: Sequence[Detector],
         lead_in_ms: Mapping[str, int],
         poll_hz: float,
-        hold_until_stream_active: bool,
+        hold_until_output_active: bool,
         raw_sink: RawSink | None = None,
         raw_dump_hz: float = 1.0,
         monotonic=time.monotonic,
@@ -78,7 +80,7 @@ class PollLoop:
         self._detectors = tuple(detectors)
         self._lead_in_ms = dict(lead_in_ms)
         self._interval = 1.0 / poll_hz
-        self._hold_until_stream_active = hold_until_stream_active
+        self._hold_until_output_active = hold_until_output_active
         self._raw_sink = raw_sink
         self._raw_interval = 1.0 / raw_dump_hz
         self._monotonic = monotonic
@@ -102,14 +104,44 @@ class PollLoop:
         self._reported_player_identity = False
         self._reported_holding = False
         self._reported_track_wetness_absent = False
+        self._active = False
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def activate(self) -> None:
+        """Start a fresh capture window without diffing against stale state."""
+        if self._active:
+            return
+        self._active = True
+        self._previous = None
+
+    def reset_session(self) -> None:
+        """Clear state that must not cross an iRacing SDK session boundary."""
+        self._previous = None
+        self._session_num = None
+        self._next_raw_dump_at = None
+        self._snapshot_enricher = SnapshotEnricher()
+        self._reset_race_phase()
+        self._reported_player_identity = False
+
+    def deactivate(self) -> None:
+        """Stop capture and flush sink state that is safe to publish."""
+        if not self._active:
+            return
+        self._active = False
+        self._previous = None
+        self._drain_bus()
+        flush = getattr(self._event_sink, "flush", None)
+        if callable(flush):
+            flush()
 
     def tick(self) -> bool:
         """Process one telemetry sample; return whether any Event was emitted."""
+        if not self._active:
+            return False
         emitted = self._stamp_and_publish([]) if self._held else 0
-
-        if not self._iracing.connect():
-            self._previous = None
-            return bool(emitted)
 
         current = self._iracing.capture(TELEMETRY_FIELDS)
         if current is None:
@@ -313,32 +345,29 @@ class PollLoop:
         if not pending:
             return 0
 
-        reading = self._clock.read()
-        if not reading.output_active or reading.video_ms is None:
-            if reading.connected:
-                self._held.clear()
-                self._reported_holding = False
-                for item in pending:
-                    LOGGER.debug(
-                        "Event %s dropped — OBS not recording/streaming",
-                        item.intent.event_type,
-                    )
-            elif self._hold_until_stream_active:
-                self._held = pending
-                if not self._reported_holding:
-                    LOGGER.info("Holding Events until the OBS connection is available")
-                    self._reported_holding = True
-            else:
-                self._held.clear()
-            return 0
-
         self._held.clear()
-        self._reported_holding = False
-        for item in pending:
+        emitted = 0
+        for index, item in enumerate(pending):
+            reading = self._clock.read()
+            if not reading.output_active or reading.video_ms is None:
+                if self._hold_until_output_active:
+                    self._hold_pending(pending[index:])
+                    if not self._reported_holding:
+                        LOGGER.info("Holding Events until an OBS output becomes active")
+                        self._reported_holding = True
+                    break
+                video_ms = 0
+                LOGGER.warning(
+                    "Event %s emitted with video_ms=0 — no OBS output active",
+                    item.intent.event_type,
+                )
+            else:
+                video_ms = reading.video_ms
+                self._reported_holding = False
             intent = item.intent
             self._bus.publish(
                 Event(
-                    video_ms=reading.video_ms,
+                    video_ms=video_ms,
                     event_type=intent.event_type,
                     label=intent.label,
                     tier=intent.tier,
@@ -348,8 +377,18 @@ class PollLoop:
                     meta=dict(intent.meta),
                 )
             )
+            emitted += 1
         self._drain_bus()
-        return len(pending)
+        return emitted
+
+    def _hold_pending(self, pending: Sequence[_PendingIntent]) -> None:
+        overflow = max(0, len(pending) - MAX_HELD_EVENTS)
+        if overflow:
+            LOGGER.warning(
+                "OBS output Event buffer full; dropped %d oldest Event(s)",
+                overflow,
+            )
+        self._held = list(pending[overflow:])
 
     def _write_raw_if_due(self, values: Mapping[str, Any]) -> None:
         if self._raw_sink is None:

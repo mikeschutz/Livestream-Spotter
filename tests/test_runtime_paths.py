@@ -15,7 +15,7 @@ from livestream_spotter.runtime_paths import (
 CONFIG = b"""
 [runtime]
 poll_hz = 15
-hold_until_stream_active = false
+hold_until_output_active = false
 [obs]
 host = "localhost"
 port = 4455

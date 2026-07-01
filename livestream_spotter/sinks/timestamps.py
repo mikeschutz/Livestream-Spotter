@@ -52,8 +52,11 @@ class TimestampsSink(TimestampFileSink):
 
         self._append_event(event, label=self._published_label(event))
 
-    def close(self) -> None:
+    def flush(self) -> None:
         self._flush_open_pit()
+
+    def close(self) -> None:
+        self.flush()
         super().close()
 
     def _published_label(self, event: Event) -> str:

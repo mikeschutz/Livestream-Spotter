@@ -8,7 +8,8 @@ from livestream_spotter.config import load_config
 CONFIG = b"""
 [runtime]
 poll_hz = 20
-hold_until_stream_active = false
+timestamp_source = "record"
+hold_until_output_active = false
 [obs]
 host = "obs-box"
 port = 4456
@@ -41,7 +42,8 @@ class ConfigTests(unittest.TestCase):
             config = load_config(config_path)
 
             self.assertEqual(config.poll_hz, 20)
-            self.assertFalse(config.hold_until_stream_active)
+            self.assertEqual(config.timestamp_source, "record")
+            self.assertFalse(config.hold_until_output_active)
             self.assertTrue(config.race_only_player_events)
             self.assertTrue(config.raw_dump_enabled)
             self.assertEqual(config.raw_dump_hz, 0.5)
@@ -88,8 +90,8 @@ class ConfigTests(unittest.TestCase):
 
     def test_race_only_player_events_can_be_disabled(self) -> None:
         configured = CONFIG.replace(
-            b"hold_until_stream_active = false",
-            b"hold_until_stream_active = false\nrace_only_player_events = false",
+            b"hold_until_output_active = false",
+            b"hold_until_output_active = false\nrace_only_player_events = false",
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
@@ -98,6 +100,73 @@ class ConfigTests(unittest.TestCase):
             config = load_config(config_path)
 
             self.assertFalse(config.race_only_player_events)
+
+    def test_legacy_hold_name_is_still_honored(self) -> None:
+        configured = CONFIG.replace(
+            b"hold_until_output_active = false",
+            b"hold_until_stream_active = true",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_bytes(configured)
+
+            with self.assertLogs(
+                "livestream_spotter.config", level="WARNING"
+            ) as logs:
+                config = load_config(config_path)
+
+            self.assertTrue(config.hold_until_output_active)
+            self.assertEqual(len(logs.output), 1)
+            self.assertIn(
+                "Config key 'hold_until_stream_active' is deprecated",
+                logs.output[0],
+            )
+            self.assertIn("removed in 0.2.0", logs.output[0])
+
+    def test_new_hold_name_wins_over_legacy_alias(self) -> None:
+        configured = CONFIG.replace(
+            b"hold_until_output_active = false",
+            (
+                b"hold_until_output_active = false\n"
+                b"hold_until_stream_active = true"
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_bytes(configured)
+
+            with self.assertLogs(
+                "livestream_spotter.config", level="WARNING"
+            ) as logs:
+                config = load_config(config_path)
+
+            self.assertFalse(config.hold_until_output_active)
+            self.assertEqual(len(logs.output), 2)
+            self.assertIn("deprecated", logs.output[0])
+            self.assertIn("both set", logs.output[1])
+            self.assertIn("using 'hold_until_output_active'", logs.output[1])
+
+    def test_timestamp_source_defaults_to_auto(self) -> None:
+        configured = CONFIG.replace(b'timestamp_source = "record"\n', b"")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_bytes(configured)
+
+            config = load_config(config_path)
+
+            self.assertEqual(config.timestamp_source, "auto")
+
+    def test_rejects_unknown_timestamp_source(self) -> None:
+        configured = CONFIG.replace(
+            b'timestamp_source = "record"',
+            b'timestamp_source = "replay"',
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_bytes(configured)
+
+            with self.assertRaisesRegex(ValueError, "timestamp_source"):
+                load_config(config_path)
 
     def test_rejects_non_positive_poll_rate(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -1,8 +1,8 @@
-# SPEC — iRacing → YouTube Chapter Marker Tool
+# SPEC — iRacing → YouTube Timestamp Marker Tool
 
 ## Purpose
 
-A lightweight Python sidecar that runs during a live iRacing broadcast, reads telemetry from the iRacing SDK, detects race events worth marking, and timestamps each one against the **OBS stream timeline**. Primary output is a paste-ready `chapters.txt` for the YouTube description. The same event stream is designed to later feed live-chat posts, overlays, or auto-clipping without rework.
+A lightweight Python sidecar that runs during a live iRacing broadcast, reads telemetry from the iRacing SDK, detects race events worth marking, and timestamps each one against the **OBS output timeline** (stream or recording). Primary output is a paste-ready `timestamps.txt` for the YouTube description. The same event stream is designed to later feed live-chat posts, overlays, or auto-clipping without rework.
 
 This is a small tool. Keep it small. The architecture below exists only so the output side can grow later — it is not a license to build that growth now.
 
@@ -26,17 +26,6 @@ Single decoupled pipeline. This separation is the **one structural decision that
 - **Raw diagnostic dump** (the Phase 1 instrumentation) is **off by default** and its write cadence is **decoupled from poll rate** — poll at ~15 Hz for detector responsiveness, but never emit a per-tick JSONL row in steady state. A full per-tick dump produced a "huge" file in ~18 min; it is a debugging tool, not a production path. Production emits only Events.
 
 The OBS client is a **service the pipeline calls**, not a stage. When an event is emitted, the pipeline asks OBS for the current video time and stamps it — the detector never touches OBS.
-
----
-
-## The OBS sync contract (read this twice)
-
-Video timestamps come from **OBS, never from iRacing.**
-
-- On event creation, call OBS WebSocket `GetStreamStatus`. The response field `outputDuration` (milliseconds since the stream output started) **is** the elapsed video time at that instant. Convert to `HH:MM:SS` for the chapter.
-- **Never use irsdk `SessionTime` for video timestamps.** It is seconds since _session_ start, it resets at every session transition, and it has no relationship to the OBS timeline. Using it will silently produce wrong chapters. `SessionTime` may be stored on the event for debugging only.
-- `outputDuration` is only valid while the stream output is active (`outputActive == true`). If an event fires before the stream is live, hold it or drop it per config — do not stamp it with a stale/zero duration.
-- Optional optimization: capture `outputDuration` once at the first event and compute later stamps from a local monotonic clock + that offset, to avoid a WebSocket round-trip per event. Round-tripping per event is also fine at our event frequency. Verify drift over a 2-hour run before trusting the offset approach (see Empirical Risks).
 
 ---
 
@@ -166,6 +155,112 @@ Determined by how YouTube actually behaves on live streams:
 
 ---
 
+## Application Lifecycle
+
+Livestream Spotter is designed to run continuously in the background across many sessions, including across system sleep/wake cycles. It does meaningful work only when both iRacing and OBS are active; at all other times it idles cheaply.
+
+This lifecycle model supersedes earlier ad-hoc connection handling. Two bugs in v0.1.1 motivated the redesign and are resolved by this model:
+
+- **Recording-only drops** — the old `ObsClock` queried only `GetStreamStatus`, so timestamps were unavailable when OBS was recording locally without streaming. The new timestamp model treats stream and recording as equally valid output sources.
+- **`hold_until_stream_active = false` dropped events instead of emitting them** — the old connected-but-inactive branch dropped unconditionally. The new model honors the config: `false` means emit, `true` means buffer.
+
+The config option is renamed `hold_until_output_active` to reflect that either stream or recording satisfies it. The old name `hold_until_stream_active` is accepted as a deprecated alias through the 0.1.x line and will be removed in 0.2.0.
+
+### States
+
+The application occupies one of four states at any time:
+
+- **Idle** — iRacing is not in an active session. No work is being done. OBS connection may or may not be established (see below); if it is, event subscriptions are warm but unused.
+- **Waiting for OBS** — iRacing is in an active session, but OBS is not connected. The app is polling OBS at a fixed interval, waiting for it to become available. No events are being captured.
+- **Waiting for iRacing** — OBS is connected and subscribed, but iRacing is not in an active session. Effectively equivalent to Idle from the user's perspective, but distinguished internally because OBS state is already warm.
+- **Active** — iRacing is in an active session and OBS is connected. Events are being captured, timestamped, and emitted. **Note:** OBS being connected does not imply an output (stream or recording) is currently active. When an event fires in Active state with no output running, timestamping behavior is governed by `hold_until_output_active` (see Timestamp model).
+
+State transitions are driven by two independent signals: iRacing session active/inactive, and OBS connected/disconnected.
+
+### Startup
+
+On launch, the app performs a one-shot connectivity check against both iRacing and OBS, primarily to surface configuration or setup problems early.
+
+- If OBS is reachable, the app connects and subscribes to its state-change events immediately. Connection and subscription are treated as a single concept: **whenever OBS is connected, we are subscribed.**
+- If iRacing is already in an active session at launch (uncommon but possible), the app treats it as a session-start transition.
+- If neither is available, the app enters Idle and waits.
+
+Startup never blocks on either dependency. The app is always ready to enter its waiting states.
+
+### OBS connection lifecycle
+
+OBS may be connected or disconnected independently of iRacing's state.
+
+- **Connection attempts** are made at launch, and thereafter on a fixed 10-second interval whenever iRacing is in an active session and OBS is not connected. The interval is constant; no backoff. The check is lightweight on a local WebSocket and has no measurable system impact.
+- **No connection attempts** are made while iRacing is idle. There is no purpose in maintaining an OBS connection when there is no work to do.
+- **On successful connection**, the app subscribes to OBS state-change events (`StreamStateChanged`, `RecordStateChanged`, and pause/resume events as applicable) and performs a one-shot sample of current stream and record status to seed timing state.
+- **On disconnect**, whether at startup, mid-session, or otherwise, the same 10-second retry loop applies, conditional on iRacing being active. Mid-session disconnects are not a special case — the retry loop handles them identically to a never-connected state.
+
+### iRacing session lifecycle
+
+iRacing's session state is the primary trigger for whether the app does work.
+
+- **Session start** transitions the app out of Idle. If OBS is already connected, the app enters Active immediately. If not, it enters Waiting for OBS and begins the retry loop described above.
+- **Session end** transitions the app back to Idle. The OBS connection is retained if currently connected — there is no benefit to tearing it down — but no further reconnection attempts are made until the next session.
+
+### Timestamp model
+
+Video timestamps come from **OBS, never from iRacing.** They are derived from OBS's `outputDuration`, sampled once and then extrapolated locally against the system monotonic clock.
+
+**The contract:**
+
+- Either stream output or recording output is a valid timestamp source. The app polls both `GetStreamStatus` and `GetRecordStatus` at the seed sample and selects the active source per the `timestamp_source` config (`auto` | `stream` | `record`; `auto` prefers stream when both are active).
+- On OBS connection, and on every relevant state-change event (stream/record start, stop, pause, resume), the app samples the current `outputDuration` of the selected source and records the local monotonic clock time at the moment of sampling.
+- When an event needs a timestamp, the app computes `sampled_duration + (monotonic_now - monotonic_at_sample)`. No additional OBS queries are made in the hot path.
+- This is correct because both processes share the same monotonic clock on a single machine, and OBS's `outputDuration` advances at wall-clock rate except during pause, which is signaled explicitly via events.
+- Convert the resulting ms value to `H:MM:SS` (or `MM:SS` under an hour) at the sink layer.
+
+**Hard rules:**
+
+- **Never use irsdk `SessionTime` for video timestamps.** It is seconds since _session_ start, it resets at every session transition, and it has no relationship to the OBS timeline. Using it will silently produce wrong chapters. `SessionTime` may be stored on the event for debugging only.
+- **`outputDuration` is only valid while the selected output is active** (`outputActive == true` for that output). If neither stream nor recording is active when an event occurs, behavior is governed by `hold_until_output_active`:
+    - `true` → buffer the event; emit when an output becomes active using the timestamp at emission.
+    - `false` → emit the event with `video_ms = 0` and a warning. Never drop.
+- **Output restarts reset `outputDuration`.** A stop/start cycle on the same output begins a new timeline. The state-change event subscription handles this correctly by re-sampling on every start event; the offset math never bridges two separate output sessions.
+
+### Future hooks
+
+The lifecycle is designed to accommodate a future option to **automatically start an OBS output** (stream or recording) on a specific iRacing session-type transition — for example, auto-starting recording when a qualifying or race session begins, without requiring the user to manually start it in OBS. This would plug in at the iRacing session-start transition: before entering Active, the app would issue a `StartStream` or `StartRecord` request to OBS based on configuration. No structural changes to the lifecycle would be required to support this.
+
+### State diagram
+
+```mermaid
+stateDiagram-v2
+    direction TB
+
+    [*] --> Startup
+
+    Startup --> Idle
+    Startup --> WaitingForIRacing
+    Startup --> WaitingForOBS
+    Startup --> Active
+
+    Idle --> Active: iRacing start (OBS up)
+    Idle --> WaitingForOBS: iRacing start (OBS down)
+
+    WaitingForIRacing --> Active: iRacing start
+    WaitingForIRacing --> Idle: OBS disconnect
+
+    WaitingForOBS --> Active: OBS connects
+    WaitingForOBS --> Idle: iRacing end
+
+    Active --> WaitingForIRacing: iRacing end
+    Active --> WaitingForOBS: OBS disconnect
+    Active --> Idle: iRacing end + OBS disconnect
+
+    note right of Idle: No polling. No work.
+    note right of WaitingForOBS: Poll OBS every 10s.
+    note right of WaitingForIRacing: OBS warm, waiting.
+    note right of Active: Capturing events.
+```
+
+---
+
 ## Config surface (single file, e.g. `config.toml`)
 
 - poll rate (Hz)
@@ -176,14 +271,17 @@ Determined by how YouTube actually behaves on live streams:
 - enabled detectors + per-tier verbosity
 - output path; profile preset (`sprint` | `enduro`)
 - OBS WebSocket host/port/password
-- "hold events until stream active" (bool)
+- `timestamp_source`: `auto` | `stream` | `record` (default `auto`)
+- `hold_until_output_active` (bool) — `false` emits with `video_ms = 0` and warns; `true` buffers. The legacy name `hold_until_stream_active` is accepted as a deprecated alias through 0.1.x and removed in 0.2.0.
 
 ---
 
 ## Phase 1 gate findings (recorded — real data, not guesses)
 
 - **F2 gap**: resolved — see Gap signal above.
-- **`outputDuration` monotonic**: 16,570 samples over ~18 min, **zero regressions**, ~1:1 with wall clock. Safe to stamp events from OBS time. _Still open, deferred to before Phase 4 (writer):_ full 2-hour drift, and the deliberate stream stop/start — a restart begins a new output and `outputDuration` is expected to reset; the writer must not treat that reset as one timeline.
+- **`outputDuration` monotonic**: 16,570 samples over ~18 min, **zero regressions**, ~1:1 with wall clock. Safe to stamp events from OBS time.
+- **Output restart resets `outputDuration`**: resolved by design. The new timestamp model re-samples on every stream/record state-change event, so a stop/start cycle begins a fresh offset and the math never bridges two output sessions.
+- **2-hour drift**: moot under the new timestamp model. Drift is bounded by the interval between state-change events, not by total run length, because each state-change re-seeds the sample.
 - **`TrackWetness`**: present in build; dry = `1` (matches enum). Wet values / chatter untested (no wet replay) — verify when the rain detector (Tier 2) is built.
 
 ## Empirical risks (cannot be specified — must be observed against real runs)
@@ -193,7 +291,7 @@ These are the things to watch when validating each phase. Do not pre-solve them 
 - **Pit-cycle position shuffle**: running order reshuffles as cars pit, faking overtakes. Gate overtake events on neither car being in a pit cycle; ideally confirm with on-track adjacency via `CarIdxLapDistPct`.
 - **Incident-counter noise**: confirm whether minor +1s are worth logging or just clutter.
 - **Battle-detector spam**: one long fight must collapse to one event — verify the throttle holds across position swaps within the fight.
-- **`outputDuration` behavior**: check it never goes backwards, and confirm what it does if the stream is paused/reconnected; decide offset-vs-round-trip after measuring drift over a full 2-hour run.
+- **`outputDuration` regression check**: confirm it never goes backwards within a single output session. (Across sessions it resets — that case is handled by the state-change re-sample, not a regression.)
 - **Lead-in offset tuning**: the right pre-roll per event type can't be reasoned out blind — especially wrecks, where "the moment it became inevitable" is ~2 s before contact in one case and ~8 s in another. Start from config defaults, watch how the resulting chapters open on replays, and adjust per type. The detector fires at the _instant_; choosing how far back to point is a tuning exercise, not a detection problem. Consider whether a couple of incident severities (e.g. spin vs. heavy hit) deserve different lead-ins.
 - **`TrackWetness` threshold chatter**: may oscillate near the boundary — needs debounce.
 - **Invalid car-array entries**: cars in garage / not in session report 0 or -1 positions; filter before computing deltas.
@@ -216,9 +314,10 @@ These are the things to watch when validating each phase. Do not pre-solve them 
 Ideas worth preserving so the v1 architecture doesn't accidentally foreclose them. Do not build these yet; just don't design in a way that blocks them.
 
 - **Auto sprint/enduro profile.** The preset is config-driven for now. Later, read scheduled race length from the session YAML (`SessionInfo.Sessions[].SessionLaps` / `SessionTime`, plus `WeekendInfo`) and pick `sprint` vs `enduro` automatically — falling back to config when ambiguous. Self-explanatory once the YAML is already being parsed for class data, so the cost is low when the time comes.
-- **Always-on background daemon.** Eventually run continuously and self-arm: capture only when it detects _both_ an active iRacing session **and** OBS streaming, then stand down when either drops. This is a supervisor wrapped around the existing pipeline (the pipeline already needs both connections), so the v1 design supports it for free as long as connect/disconnect are clean, idempotent, and the loop tolerates either source appearing/disappearing mid-run. Build the connection layer with that lifecycle in mind even though the daemon itself is later.
+- **Auto-start OBS output on iRacing session type.** See Application Lifecycle → Future hooks. Trigger a `StartStream` or `StartRecord` request when a configured session type (e.g. qual, race) begins, so the user doesn't have to remember to start OBS manually.
 - **Manual marker via keybind.** A hotkey the user hits to mark "remember this" in the moment — for things no telemetry signal can catch (the great battle, the "cold tires!" moment, a funny radio call). Architecturally trivial: it is just _another detector / event source_ — a keypress emits an event (likely Tier 1, placeholder label the user renames later) onto the same bus, gets the same OBS stamp, flows to whichever sink. Only new plumbing is a hotkey listener; note iRacing does NOT expose custom binds to the SDK, so this is a global key hook or a Stream Deck button, not an in-sim bind. Everything downstream already exists.
 - **Strict duration-scaled chapters.** Use the parked strict-chapter renderer to emit a coarse contiguous chapter track — practice / qual / green-first-lap / white-flag-last-lap as segment boundaries, granularity scaling with scheduled race length (feeds directly off the auto sprint/enduro YAML read above). Additive: a second sink + a coarse segmenter, not a rewrite. Both renderers run over the same event stream.
 - **Race-control message stream as a richer incident source.** iRacing logs exact incident detail to its in-sim text/race-control log ("Car #21 Contact 2x→4x Total 14/17x"), confirmed visible in testing. This is NOT in the telemetry SDK the tool polls — it lives in the message/chat stream (and the replay/session file). v1 infers contact attribution from car proximity instead. If exact incident attribution ever justifies it, the known path is parsing the message/chat channel or the replay file — a separate integration with its own timing/reliability, not a telemetry field. Banked so it isn't rediscovered.
 - **Complex pit/tow/repair sequences.** v1 consolidates a normal pit_in→pit_out into one line and annotates an embedded tow. Edge cases left for later: a long repair during which other events occur (may warrant breaking the single line back out), and unusual multi-stage sequences. Keep the simple consolidation until a real case demands more.
 - **Post-checkered pit / finishing in pit lane.** A pit_out after the checkered produced a stray published line in testing. Rare (finishing a race in the pits is uncommon), so deferred — suppress or specially handle post-checkered pit events if it ever matters.
+
